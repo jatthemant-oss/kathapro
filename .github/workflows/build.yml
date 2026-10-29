@@ -1,0 +1,625 @@
+name: Build Premium Katha APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Project Files
+        run: |
+          mkdir -p app/src/main/java/com/katha/scheduler
+
+          cat << 'EOF' > settings.gradle
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          buildscript {
+              repositories { google(); mavenCentral() }
+              dependencies { classpath 'com.android.tools.build:gradle:7.4.2' }
+          }
+          allprojects {
+              repositories { google(); mavenCentral() }
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.katha.scheduler'
+              compileSdk 33
+              defaultConfig {
+                  applicationId "com.katha.scheduler"
+                  minSdk 21
+                  targetSdk 22
+                  versionCode 2
+                  versionName "2.0-Premium"
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.katha.scheduler">
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+
+              <application
+                  android:label="Katha Studio Pro"
+                  android:icon="@android:drawable/ic_lock_silent_mode_off"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".KathaService" android:enabled="true" android:exported="false"/>
+                  <receiver android:name=".AlarmReceiver" android:exported="true"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/katha/scheduler/KathaService.java
+          package com.katha.scheduler;
+
+          import android.app.*;
+          import android.content.*;
+          import android.media.MediaPlayer;
+          import android.net.Uri;
+          import android.os.*;
+
+          public class KathaService extends Service {
+              public static MediaPlayer player;
+              public static String currentTitle = "Koi Katha Nahi Chal Rahi";
+              public static boolean isPlaying = false;
+              private PowerManager.WakeLock wakeLock;
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null) return START_STICKY;
+                  String action = intent.getAction();
+
+                  if ("ACTION_PLAY_NEW".equals(action)) {
+                      String uriStr = intent.getStringExtra("uri");
+                      currentTitle = intent.getStringExtra("title");
+                      if (currentTitle == null) currentTitle = "Scheduled Audio Playing";
+                      startKatha(uriStr);
+                  } else if ("ACTION_TOGGLE".equals(action)) {
+                      if (player != null) {
+                          if (player.isPlaying()) {
+                              player.pause();
+                              isPlaying = false;
+                          } else {
+                              player.start();
+                              isPlaying = true;
+                          }
+                      }
+                  } else if ("ACTION_SEEK".equals(action)) {
+                      if (player != null) {
+                          int pos = intent.getIntExtra("pos", 0);
+                          player.seekTo(Math.max(0, Math.min(pos, player.getDuration())));
+                      }
+                  } else if ("ACTION_STOP".equals(action)) {
+                      stopAndClean();
+                  }
+                  return START_STICKY;
+              }
+
+              private void startKatha(String uriStr) {
+                  if (uriStr == null) return;
+                  String channelId = "katha_pro_channel";
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      NotificationChannel ch = new NotificationChannel(channelId, "Katha Studio Player", NotificationManager.IMPORTANCE_LOW);
+                      getSystemService(NotificationManager.class).createNotificationChannel(ch);
+                  }
+                  Notification notif = new Notification.Builder(this, channelId)
+                          .setContentTitle("Katha Studio Pro")
+                          .setContentText("Playing: " + currentTitle)
+                          .setSmallIcon(android.R.drawable.ic_media_play)
+                          .build();
+                  startForeground(101, notif);
+
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KathaPro::WakeLock");
+                  wakeLock.acquire(15 * 60 * 60 * 1000L); // 15 Hours lock safety
+
+                  try {
+                      if (player != null) player.release();
+                      player = new MediaPlayer();
+                      player.setWakeMode(getApplicationContext(), PowerManager.PARTIAL_WAKE_LOCK);
+                      player.setDataSource(getApplicationContext(), Uri.parse(uriStr));
+                      player.prepare();
+                      player.start();
+                      isPlaying = true;
+
+                      player.setOnCompletionListener(mp -> stopAndClean());
+                  } catch (Exception e) {
+                      stopAndClean();
+                  }
+              }
+
+              private void stopAndClean() {
+                  isPlaying = false;
+                  currentTitle = "Koi Katha Nahi Chal Rahi";
+                  if (player != null) {
+                      try { player.stop(); } catch (Exception ignored) {}
+                      player.release();
+                      player = null;
+                  }
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  stopForeground(true);
+                  stopSelf();
+              }
+
+              @Override
+              public void onDestroy() {
+                  stopAndClean();
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/katha/scheduler/AlarmReceiver.java
+          package com.katha.scheduler;
+
+          import android.app.*;
+          import android.content.*;
+          import android.os.Build;
+
+          public class AlarmReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  String uri = intent.getStringExtra("uri");
+                  String title = intent.getStringExtra("title");
+                  int id = intent.getIntExtra("id", 0);
+
+                  long nextWeek = System.currentTimeMillis() + (7L * 24 * 60 * 60 * 1000L);
+                  AlarmManager am = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  PendingIntent pi = PendingIntent.getBroadcast(context, id, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                      am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextWeek, pi);
+                  } else {
+                      am.setExact(AlarmManager.RTC_WAKEUP, nextWeek, pi);
+                  }
+
+                  Intent sIntent = new Intent(context, KathaService.class);
+                  sIntent.setAction("ACTION_PLAY_NEW");
+                  sIntent.putExtra("uri", uri);
+                  sIntent.putExtra("title", title);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      context.startForegroundService(sIntent);
+                  } else {
+                      context.startService(sIntent);
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/katha/scheduler/MainActivity.java
+          package com.katha.scheduler;
+
+          import android.app.*;
+          import android.content.*;
+          import android.graphics.*;
+          import android.graphics.drawable.GradientDrawable;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.os.*;
+          import android.view.*;
+          import android.widget.*;
+          import java.util.*;
+
+          public class MainActivity extends Activity {
+              private Uri selectedMp3;
+              private String selectedFileName = "Koi File Select Nahi Hai";
+              private TextView fileLabel, nowPlayingTitle, timeCounter;
+              private SeekBar seekBar;
+              private Button playPauseBtn;
+              private TimePicker timePicker;
+              private ToggleButton[] dayToggles = new ToggleButton[7];
+              private String[] dayNames = {"S", "M", "T", "W", "T", "F", "S"};
+              private String[] fullDayNames = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+              private LinearLayout scheduleListLayout;
+              private SharedPreferences prefs;
+              private Handler uiHandler = new Handler();
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  prefs = getSharedPreferences("KathaSchedules", MODE_PRIVATE);
+
+                  ScrollView rootScroll = new ScrollView(this);
+                  rootScroll.setBackgroundColor(Color.parseColor("#0F1016"));
+
+                  LinearLayout mainLayout = new LinearLayout(this);
+                  mainLayout.setOrientation(LinearLayout.VERTICAL);
+                  mainLayout.setPadding(36, 48, 36, 60);
+
+                  // HEADER
+                  TextView header = new TextView(this);
+                  header.setText("✨ KATHA STUDIO PRO");
+                  header.setTextColor(Color.parseColor("#FFB300"));
+                  header.setTextSize(22);
+                  header.setTypeface(Typeface.DEFAULT_BOLD);
+                  mainLayout.addView(header);
+
+                  TextView subHeader = new TextView(this);
+                  subHeader.setText("10+ Hours Non-Stop Auto Scheduler • Zero Battery Drop");
+                  subHeader.setTextColor(Color.parseColor("#8E92A4"));
+                  subHeader.setTextSize(12);
+                  subHeader.setPadding(0, 4, 0, 32);
+                  mainLayout.addView(subHeader);
+
+                  // 1. LIVE PLAYER CONTROL CARD
+                  LinearLayout playerCard = createCard("#1A1C26", "#FFB300", 3);
+                  TextView badge = new TextView(this);
+                  badge.setText("● LIVE PLAYER CONTROLLER");
+                  badge.setTextColor(Color.parseColor("#00E676"));
+                  badge.setTextSize(11);
+                  badge.setTypeface(Typeface.DEFAULT_BOLD);
+                  playerCard.addView(badge);
+
+                  nowPlayingTitle = new TextView(this);
+                  nowPlayingTitle.setText(KathaService.currentTitle);
+                  nowPlayingTitle.setTextColor(Color.WHITE);
+                  nowPlayingTitle.setTextSize(16);
+                  nowPlayingTitle.setTypeface(Typeface.DEFAULT_BOLD);
+                  nowPlayingTitle.setPadding(0, 12, 0, 16);
+                  playerCard.addView(nowPlayingTitle);
+
+                  seekBar = new SeekBar(this);
+                  seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          if (fromUser) sendServiceAction("ACTION_SEEK", p);
+                      }
+                      public void onStartTrackingTouch(SeekBar s) {}
+                      public void onStopTrackingTouch(SeekBar s) {}
+                  });
+                  playerCard.addView(seekBar);
+
+                  timeCounter = new TextView(this);
+                  timeCounter.setText("00:00:00 / 00:00:00");
+                  timeCounter.setTextColor(Color.parseColor("#B0B3C6"));
+                  timeCounter.setTextSize(12);
+                  timeCounter.setGravity(Gravity.END);
+                  timeCounter.setPadding(0, 4, 0, 20);
+                  playerCard.addView(timeCounter);
+
+                  // Control Buttons Row
+                  LinearLayout ctrlRow = new LinearLayout(this);
+                  ctrlRow.setGravity(Gravity.CENTER);
+
+                  Button rewBtn = createStyledButton("⏪ -10s", "#2A2D3E", Color.WHITE);
+                  rewBtn.setOnClickListener(v -> {
+                      if (KathaService.player != null)
+                          sendServiceAction("ACTION_SEEK", KathaService.player.getCurrentPosition() - 10000);
+                  });
+
+                  playPauseBtn = createStyledButton("⏯ Play/Pause", "#FFB300", Color.BLACK);
+                  playPauseBtn.setOnClickListener(v -> sendServiceAction("ACTION_TOGGLE", 0));
+
+                  Button fwdBtn = createStyledButton("+10s ⏩", "#2A2D3E", Color.WHITE);
+                  fwdBtn.setOnClickListener(v -> {
+                      if (KathaService.player != null)
+                          sendServiceAction("ACTION_SEEK", KathaService.player.getCurrentPosition() + 10000);
+                  });
+
+                  Button stopBtn = createStyledButton("⏹ Stop", "#CF6679", Color.BLACK);
+                  stopBtn.setOnClickListener(v -> sendServiceAction("ACTION_STOP", 0));
+
+                  ctrlRow.addView(rewBtn);
+                  ctrlRow.addView(playPauseBtn);
+                  ctrlRow.addView(fwdBtn);
+                  ctrlRow.addView(stopBtn);
+                  playerCard.addView(ctrlRow);
+                  mainLayout.addView(playerCard);
+
+                  // 2. SCHEDULE CREATOR CARD
+                  LinearLayout schedCard = createCard("#1A1C26", "#2E3244", 2);
+                  TextView schedTitle = new TextView(this);
+                  schedTitle.setText("➕ NAYA SCHEDULE SET KAREIN");
+                  schedTitle.setTextColor(Color.parseColor("#FFB300"));
+                  schedTitle.setTextSize(14);
+                  schedTitle.setTypeface(Typeface.DEFAULT_BOLD);
+                  schedTitle.setPadding(0, 0, 0, 20);
+                  schedCard.addView(schedTitle);
+
+                  Button pickBtn = createStyledButton("🎵  MP3 Katha / Music File Chunein", "#2A2D3E", Color.WHITE);
+                  pickBtn.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.setType("audio/*");
+                      i.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      startActivityForResult(i, 100);
+                  });
+                  schedCard.addView(pickBtn);
+
+                  fileLabel = new TextView(this);
+                  fileLabel.setText(selectedFileName);
+                  fileLabel.setTextColor(Color.parseColor("#00E676"));
+                  fileLabel.setTextSize(12);
+                  fileLabel.setPadding(8, 12, 8, 16);
+                  schedCard.addView(fileLabel);
+
+                  // Test Play Now Button
+                  Button testPlayBtn = createStyledButton("▶ Abhi Chala Kar Check Karein (Instant Play)", "#03DAC6", Color.BLACK);
+                  testPlayBtn.setOnClickListener(v -> {
+                      if (selectedMp3 == null) {
+                          Toast.makeText(this, "Pehle MP3 File Chunein!", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      Intent sIntent = new Intent(this, KathaService.class);
+                      sIntent.setAction("ACTION_PLAY_NEW");
+                      sIntent.putExtra("uri", selectedMp3.toString());
+                      sIntent.putExtra("title", selectedFileName);
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(sIntent);
+                      else startService(sIntent);
+                  });
+                  schedCard.addView(testPlayBtn);
+
+                  timePicker = new TimePicker(this);
+                  timePicker.setIs24HourView(false);
+                  schedCard.addView(timePicker);
+
+                  TextView dayTitle = new TextView(this);
+                  dayTitle.setText("Din Chunein (Multiple Days):");
+                  dayTitle.setTextColor(Color.WHITE);
+                  dayTitle.setPadding(0, 16, 0, 12);
+                  schedCard.addView(dayTitle);
+
+                  LinearLayout daysRow = new LinearLayout(this);
+                  daysRow.setWeightSum(7);
+                  for (int i = 0; i < 7; i++) {
+                      dayToggles[i] = new ToggleButton(this);
+                      dayToggles[i].setTextOn(dayNames[i]);
+                      dayToggles[i].setTextOff(dayNames[i]);
+                      dayToggles[i].setChecked(true);
+                      dayToggles[i].setTextColor(Color.WHITE);
+                      LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, 110, 1f);
+                      lp.setMargins(4, 0, 4, 0);
+                      dayToggles[i].setLayoutParams(lp);
+                      daysRow.addView(dayToggles[i]);
+                  }
+                  schedCard.addView(daysRow);
+
+                  Button saveSchedBtn = createStyledButton("💾  SCHEDULE SAVE KAREIN", "#FFB300", Color.BLACK);
+                  LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  saveLp.setMargins(0, 28, 0, 0);
+                  saveSchedBtn.setLayoutParams(saveLp);
+                  saveSchedBtn.setOnClickListener(v -> saveSchedule());
+                  schedCard.addView(saveSchedBtn);
+
+                  mainLayout.addView(schedCard);
+
+                  // 3. SAVED SCHEDULES LIST
+                  TextView listHeader = new TextView(this);
+                  listHeader.setText("📅 SAVED SCHEDULES (Active Alarms)");
+                  listHeader.setTextColor(Color.parseColor("#FFB300"));
+                  listHeader.setTextSize(14);
+                  listHeader.setTypeface(Typeface.DEFAULT_BOLD);
+                  listHeader.setPadding(8, 20, 0, 16);
+                  mainLayout.addView(listHeader);
+
+                  scheduleListLayout = new LinearLayout(this);
+                  scheduleListLayout.setOrientation(LinearLayout.VERTICAL);
+                  mainLayout.addView(scheduleListLayout);
+
+                  rootScroll.addView(mainLayout);
+                  setContentView(rootScroll);
+
+                  refreshScheduleList();
+                  startUiUpdater();
+              }
+
+              private LinearLayout createCard(String bgHex, String borderHex, int strokeWidth) {
+                  LinearLayout card = new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  card.setPadding(32, 32, 32, 32);
+                  GradientDrawable gd = new GradientDrawable();
+                  gd.setColor(Color.parseColor(bgHex));
+                  gd.setCornerRadius(28f);
+                  gd.setStroke(strokeWidth, Color.parseColor(borderHex));
+                  card.setBackground(gd);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.setMargins(0, 0, 0, 32);
+                  card.setLayoutParams(lp);
+                  return card;
+              }
+
+              private Button createStyledButton(String text, String bgHex, int textColor) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setTextColor(textColor);
+                  b.setTypeface(Typeface.DEFAULT_BOLD);
+                  b.setAllCaps(false);
+                  GradientDrawable gd = new GradientDrawable();
+                  gd.setColor(Color.parseColor(bgHex));
+                  gd.setCornerRadius(20f);
+                  b.setBackground(gd);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.setMargins(8, 8, 8, 8);
+                  b.setLayoutParams(lp);
+                  b.setPadding(28, 20, 28, 20);
+                  return b;
+              }
+
+              private void sendServiceAction(String action, int pos) {
+                  Intent i = new Intent(this, KathaService.class);
+                  i.setAction(action);
+                  i.putExtra("pos", pos);
+                  startService(i);
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == 100 && res == RESULT_OK && data != null) {
+                      selectedMp3 = data.getData();
+                      getContentResolver().takePersistableUriPermission(selectedMp3, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      String seg = selectedMp3.getLastPathSegment();
+                      selectedFileName = seg != null ? seg : "Selected_Katha.mp3";
+                      fileLabel.setText("✔ Selected: " + selectedFileName);
+                  }
+              }
+
+              private void saveSchedule() {
+                  if (selectedMp3 == null) {
+                      Toast.makeText(this, "Kripya pehle MP3 Katha File chunein!", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+                  int hour = timePicker.getCurrentHour();
+                  int min = timePicker.getCurrentMinute();
+                  StringBuilder daysStr = new StringBuilder();
+                  List<Integer> alarmIds = new ArrayList<>();
+
+                  for (int i = 0; i < 7; i++) {
+                      if (dayToggles[i].isChecked()) {
+                          Calendar cal = Calendar.getInstance();
+                          cal.set(Calendar.DAY_OF_WEEK, i + 1);
+                          cal.set(Calendar.HOUR_OF_DAY, hour);
+                          cal.set(Calendar.MINUTE, min);
+                          cal.set(Calendar.SECOND, 0);
+                          if (cal.getTimeInMillis() <= System.currentTimeMillis()) {
+                              cal.add(Calendar.DAY_OF_YEAR, 7);
+                          }
+                          int id = (int) (System.currentTimeMillis() % 100000) + (i * 1000);
+                          alarmIds.add(id);
+
+                          Intent intent = new Intent(this, AlarmReceiver.class);
+                          intent.putExtra("uri", selectedMp3.toString());
+                          intent.putExtra("title", selectedFileName);
+                          intent.putExtra("id", id);
+                          PendingIntent pi = PendingIntent.getBroadcast(this, id, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                              am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), pi);
+                          } else {
+                              am.setExact(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), pi);
+                          }
+                          daysStr.append(fullDayNames[i]).append(" ");
+                      }
+                  }
+
+                  String amPm = (hour >= 12) ? "PM" : "AM";
+                  int dispHour = (hour % 12 == 0) ? 12 : (hour % 12);
+                  String timeFormatted = String.format("%02d:%02d %s", dispHour, min, amPm);
+
+                  String key = "sched_" + System.currentTimeMillis();
+                  String val = timeFormatted + "|" + daysStr.toString().trim() + "|" + selectedFileName + "|" + alarmIds.toString();
+                  prefs.edit().putString(key, val).apply();
+
+                  refreshScheduleList();
+                  Toast.makeText(this, "✅ Schedule Save Ho Gaya!", Toast.LENGTH_SHORT).show();
+              }
+
+              private void refreshScheduleList() {
+                  scheduleListLayout.removeAllViews();
+                  Map<String, ?> all = prefs.getAll();
+                  if (all.isEmpty()) {
+                      TextView empty = new TextView(this);
+                      empty.setText("Abhi koi schedule save nahi hai.");
+                      empty.setTextColor(Color.parseColor("#6E7285"));
+                      empty.setPadding(12, 0, 0, 20);
+                      scheduleListLayout.addView(empty);
+                      return;
+                  }
+                  for (Map.Entry<String, ?> entry : all.entrySet()) {
+                      String key = entry.getKey();
+                      String[] parts = entry.getValue().toString().split("\\|");
+                      if (parts.length < 3) continue;
+
+                      LinearLayout itemCard = createCard("#161822", "#2A2D3E", 1);
+                      itemCard.setOrientation(LinearLayout.HORIZONTAL);
+                      itemCard.setGravity(Gravity.CENTER_VERTICAL);
+
+                      LinearLayout infoLayout = new LinearLayout(this);
+                      infoLayout.setOrientation(LinearLayout.VERTICAL);
+                      infoLayout.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                      TextView tView = new TextView(this);
+                      tView.setText("⏰ " + parts[0]);
+                      tView.setTextColor(Color.parseColor("#FFB300"));
+                      tView.setTextSize(18);
+                      tView.setTypeface(Typeface.DEFAULT_BOLD);
+                      infoLayout.addView(tView);
+
+                      TextView dView = new TextView(this);
+                      dView.setText("📅 " + parts[1] + "\n🎵 " + parts[2]);
+                      dView.setTextColor(Color.WHITE);
+                      dView.setTextSize(12);
+                      infoLayout.addView(dView);
+
+                      Button delBtn = createStyledButton("✕", "#CF6679", Color.BLACK);
+                      delBtn.setOnClickListener(v -> {
+                          prefs.edit().remove(key).apply();
+                          refreshScheduleList();
+                          Toast.makeText(this, "Schedule Deleted", Toast.LENGTH_SHORT).show();
+                      });
+
+                      itemCard.addView(infoLayout);
+                      itemCard.addView(delBtn);
+                      scheduleListLayout.addView(itemCard);
+                  }
+              }
+
+              private String formatMs(int ms) {
+                  int sec = ms / 1000;
+                  int h = sec / 3600;
+                  int m = (sec % 3600) / 60;
+                  int s = sec % 60;
+                  return String.format("%02d:%02d:%02d", h, m, s);
+              }
+
+              private void startUiUpdater() {
+                  uiHandler.postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          nowPlayingTitle.setText(KathaService.currentTitle);
+                          if (KathaService.player != null) {
+                              try {
+                                  int cur = KathaService.player.getCurrentPosition();
+                                  int dur = KathaService.player.getDuration();
+                                  seekBar.setMax(dur);
+                                  seekBar.setProgress(cur);
+                                  timeCounter.setText(formatMs(cur) + " / " + formatMs(dur));
+                                  playPauseBtn.setText(KathaService.isPlaying ? "⏸ Pause" : "▶ Play");
+                              } catch (Exception ignored) {}
+                          } else {
+                              seekBar.setProgress(0);
+                              timeCounter.setText("00:00:00 / 00:00:00");
+                              playPauseBtn.setText("▶ Play");
+                          }
+                          uiHandler.postDelayed(this, 1000);
+                      }
+                  }, 1000);
+              }
+          }
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '7.6'
+
+      - name: Build Premium APK
+        run: gradle assembleDebug
+
+      - name: Upload Ready APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Katha-Studio-Pro-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
